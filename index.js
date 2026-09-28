@@ -284,33 +284,6 @@ const PROVIDERS = {
 
     roomUrl: (u) => `https://stripchat.com/${encodeURIComponent(u)}`,
 
-    // Перебираем зеркала: у разных доменов разные правила антибота. Если задан SC_RELAY —
-    // запрос идёт через твой Cloudflare Worker (см. cf-relay-worker.js), у него другие IP.
-    async request(u) {
-      const path = `/api/front/v2/models/username/${encodeURIComponent(u)}/cam`;
-      const relay = process.env.SC_RELAY || "";
-      const bases = ["https://stripchat.com", "https://xhamsterlive.com", "https://stripchat.global"];
-      let last, lastErr;
-      for (const base of relay ? bases.slice(0, 1) : bases) {
-        const target = base + path;
-        const headers = { Referer: `${base}/${encodeURIComponent(u)}`, "Accept-Language": "en-US,en;q=0.9" };
-        try {
-          const res = relay
-            ? await httpGet(`${relay}${relay.includes("?") ? "&" : "?"}url=${encodeURIComponent(target)}`, {
-                ...headers,
-                "X-Relay-Key": process.env.SC_RELAY_KEY || "",
-              })
-            : await httpGet(target, headers);
-          if (res.ok || res.status === 404) return res;
-          last = res;
-        } catch (e) {
-          lastErr = e;
-        }
-      }
-      if (last) return last;
-      throw lastErr;
-    },
-
     // Диагностика: /debug?key=...&site=stripchat&user=НИК — что именно отвечает Stripchat с ЭТОГО сервера
     async debug(u) {
       const probe = async (label, url, headers = {}) => {
@@ -369,33 +342,44 @@ const PROVIDERS = {
       return { verdict, probes };
     },
 
-    async checkStatus(u) {
+    // Фоллбэк: API режется антиботом, а HTML-страница профиля открывается. Статус лежит в
+    // window.__PRELOADED_STATE__ → viewCamBase.model: {"status":"off","isLive":false,"username":"..."}
+    async htmlStatus(u) {
       let res;
       try {
-        res = await this.request(u);
+        res = await httpGet(`https://stripchat.com/${encodeURIComponent(u)}`, {
+          Accept: "text/html,application/xhtml+xml",
+          "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        });
       } catch (e) {
-        console.warn(`[stripchat] ${u}: запрос не удался: ${e.message}`);
+        console.warn(`[stripchat] ${u}: HTML-запрос не удался: ${e.message}`);
         return null;
       }
       if (res.status === 404) return "offline";
       if (!res.ok) {
-        console.warn(`[stripchat] ${u}: HTTP ${res.status} (403/429 или HTML — вероятно, блок по IP)`);
+        console.warn(`[stripchat] ${u}: HTML HTTP ${res.status}`);
         return null;
       }
-      let data;
-      try {
-        data = await res.json();
-      } catch {
-        console.warn(`[stripchat] ${u}: ответ не JSON (скорее всего страница-заглушка антибота)`);
+      const html = await res.text();
+      const m = html.match(/"viewCamBase":\{"model":(\{[^{}]*\})/);
+      let model;
+      try { model = m && JSON.parse(m[1]); } catch { model = null; }
+      if (!model) {
+        console.warn(`[stripchat] ${u}: в HTML не нашёл viewCamBase.model (структура страницы изменилась?)`);
         return null;
       }
-      const user = data?.user?.user ?? data?.user ?? {};
-      const live = user.isLive ?? data?.user?.isLive ?? data?.cam?.isLive;
-      if (typeof live === "boolean") return live ? "online" : "offline";
-      const st = String(user.status || "").toLowerCase();
+      if (String(model.username || "").toLowerCase() !== u.toLowerCase()) {
+        console.warn(`[stripchat] ${u}: в HTML модель другого ника (${model.username}) — пропускаю`);
+        return null;
+      }
+      if (typeof model.isLive === "boolean") return model.isLive ? "online" : "offline";
+      const st = String(model.status || "").toLowerCase();
       if (st) return ["off", "offline", "idle"].includes(st) ? "offline" : "online";
-      console.warn(`[stripchat] ${u}: неизвестная структура ответа, ключи: ${Object.keys(data || {}).join(",")}`);
       return null;
+    },
+
+    checkStatus(u) {
+      return this.htmlStatus(u);
     },
   },
 
