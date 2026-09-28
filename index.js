@@ -201,6 +201,12 @@ const CB_RESERVED = new Set([
   "auth", "accounts", "supporter", "tipping", "api", "affiliates", "contest", "security", "terms",
 ]);
 
+const BC_RESERVED = new Set([
+  "girls", "couples", "male", "trans", "tags", "tag", "login", "signup", "register", "search", "tools",
+  "api", "contest", "models", "chat", "favorites", "blog", "help", "support", "terms", "privacy", "cams",
+  "en", "ru", "de", "es", "fr", "it", "pt", "pl", "ua",
+]);
+
 // --- Провайдеры ---------------------------------------------------------------
 
 const PROVIDERS = {
@@ -434,6 +440,64 @@ const PROVIDERS = {
         const s = data?.stream;
         if (s && (s.token || s.stream_name || (Array.isArray(s.edge_servers) && s.edge_servers.length))) return "online";
         if (data?.user) return "offline";
+      } catch {
+        // не смогли определить
+      }
+      return null;
+    },
+  },
+
+  bongacams: {
+    name: "BongaCams",
+    aliases: ["bc", "bonga", "bongacams"],
+    hosts: ["bongacams.com", "bongacams.net", "bongacams.eu", "bongacams.org", "bongacams2.com", "bongacams.ru"],
+    beta: true,
+
+    parseUrl(url) {
+      // https://bongacams.com/username  или  https://bongacams.com/profile/username
+      const segs = url.pathname.split("/").filter(Boolean);
+      if (segs[0] && segs[0].toLowerCase() === "profile") segs.shift();
+      if (!segs.length) return null;
+      let s;
+      try { s = decodeURIComponent(segs[0]); } catch { return null; }
+      if (BC_RESERVED.has(s.toLowerCase())) return null;
+      return USERNAME_RE.test(s) ? s : null;
+    },
+
+    roomUrl: (u) => `https://bongacams.com/${encodeURIComponent(u)}`,
+
+    // Внутренний AJAX-эндпоинт сайта, тот же, что дёргает плеер
+    request: (u) =>
+      fetch("https://bongacams.com/tools/amf.php", {
+        method: "POST",
+        headers: {
+          "X-Requested-With": "XMLHttpRequest",
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+          Accept: "application/json, text/javascript, */*; q=0.01",
+          Origin: "https://bongacams.com",
+          Referer: `https://bongacams.com/${encodeURIComponent(u)}`,
+          "User-Agent": BROWSER_UA,
+        },
+        body: `method=getRoomData&args[]=${encodeURIComponent(u)}&args[]=`,
+        signal: AbortSignal.timeout(10000),
+      }),
+
+    // Консервативно: online — есть videoServerUrl или showType != offline; offline — только по явным признакам
+    async checkStatus(u) {
+      try {
+        const res = await this.request(u);
+        if (res.status === 404) return "offline";
+        if (!res.ok) return null;
+        const data = await res.json().catch(() => null);
+        if (!data || data.status === "error") return null;
+
+        const perf = data.performerData || {};
+        if (perf.username && String(perf.username).toLowerCase() !== u.toLowerCase()) return null;
+
+        if (data.localData && data.localData.videoServerUrl) return "online";
+        if (typeof perf.isOnline === "boolean") return perf.isOnline ? "online" : "offline";
+        const show = String(perf.showType || "").toLowerCase();
+        if (show) return show === "offline" ? "offline" : "online";
       } catch {
         // не смогли определить
       }
