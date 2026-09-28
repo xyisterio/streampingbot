@@ -327,6 +327,19 @@ const PROVIDERS = {
           const text = body.replace(/<(script|style)[\s\S]*?<\/\1>/gi, " ").replace(/<[^>]+>/g, " ");
           r.offline_marker_in_text = /оффлайн|офлайн|offline/i.test(text);
           r.snippet = body.slice(0, 200).replace(/\s+/g, " ");
+          if (label.startsWith("html")) {
+            const esc = u.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const ctx = (re, n, w) => [...body.matchAll(re)].slice(0, n).map((m) => body.slice(Math.max(0, m.index - w), m.index + m[0].length + w).replace(/\s+/g, " "));
+            r.hints = {
+              length: body.length,
+              title: (body.match(/<title>([^<]*)/i) || [])[1] || null,
+              og: [...body.matchAll(/<meta[^>]+(?:property|name)="(og:[^"]+|twitter:[^"]+|description)"[^>]+content="([^"]*)"/gi)].slice(0, 8).map((m) => `${m[1]}=${m[2].slice(0, 120)}`),
+              state_vars: [...body.matchAll(/window\.(__[A-Z_]+__|[A-Za-z_]*[Ss]tate[A-Za-z_]*)\s*=/g)].map((m) => m[1]).slice(0, 6),
+              username_hits: (body.match(new RegExp(esc, "gi")) || []).length,
+              username_ctx: ctx(new RegExp(`"username"\\s*:\\s*"${esc}"`, "gi"), 2, 250),
+              live_flags: ctx(/"(isLive|isOnline|isBroadcasting|isCamAvailable|status)"\s*:\s*("[^"]*"|true|false)/g, 12, 50),
+            };
+          }
         } catch (e) {
           r.error = String(e);
         }
@@ -951,13 +964,18 @@ async function main() {
     console.error("BOT_TOKEN не задан");
     process.exit(1);
   }
+  // HTTP поднимаем первым: платформа должна видеть открытый порт, даже если Redis/Telegram тормозят
+  startHttpServer();
   store = await createStore();
   await migrateBadChannels().catch((e) => console.error("migrate error:", e));
-  startHttpServer();
 
-  // Старый вебхук (от воркера) мешает getUpdates — снимаем
-  console.log("deleteWebhook:", JSON.stringify(await tg("deleteWebhook", { drop_pending_updates: false })));
-  console.log("setMyCommands:", JSON.stringify(await tg("setMyCommands", { commands: BOT_COMMANDS })));
+  // Старый вебхук (от воркера) мешает getUpdates — снимаем (сбой не должен ронять процесс)
+  try {
+    console.log("deleteWebhook:", JSON.stringify(await tg("deleteWebhook", { drop_pending_updates: false })));
+    console.log("setMyCommands:", JSON.stringify(await tg("setMyCommands", { commands: BOT_COMMANDS })));
+  } catch (e) {
+    console.error("telegram init error:", e.message);
+  }
 
   setInterval(() => pollAll().catch((e) => console.error("pollAll error:", e)), CHECK_INTERVAL_SEC * 1000);
   setTimeout(() => pollAll().catch((e) => console.error("pollAll error:", e)), 5000);
