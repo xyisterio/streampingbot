@@ -13,7 +13,7 @@
  *  BOT_TOKEN           обязательно — токен от @BotFather
  *  REDIS_URL           адрес Redis, например redis://default:pass@host:6379
  *  CHECK_INTERVAL_SEC  необязательно, по умолчанию 120
- *  DEBUG_KEY           необязательно — включает GET /debug?key=...&user=... (диагностика запроса к Chaturbate)
+ *  DEBUG_KEY           необязательно — включает GET /debug?key=...&site=...&user=... (диагностика запроса к сайту)
  *  PORT                необязательно — порт для health-check, по умолчанию 3000
  */
 
@@ -75,6 +75,7 @@ const K = {
   channels: (p) => `channels:${p}`,         // set channel — все отслеживаемые каналы провайдера
   status: (p, c) => `status:${p}:${c}`,     // "online" | "offline"
   state: (chat) => `state:${chat}`,         // "awaiting_watch"
+  pending: (chat) => `pending:${chat}`,     // username, для которого ждём выбор сайта
 };
 
 async function addSubscription(chatId, provider, channel) {
@@ -110,13 +111,45 @@ async function dropChat(chatId) {
   }
 }
 
+
 // ---------------------------------------------------------------------------
-// PROVIDERS — логика конкретных сайтов. Новый сайт = новый объект с
-// parseInput(), roomUrl(), checkStatus().
+// PROVIDERS — логика конкретных сайтов.
+//
+// Чтобы добавить сайт, допиши объект в PROVIDERS. Поля:
+//   name            — название для сообщений
+//   aliases         — как сайт можно назвать в /watch (`/watch stripchat nick`)
+//   hosts           — домены, по которым ссылка узнаётся как ссылка этого сайта
+//   parseUrl(url)   — достаёт username из объекта URL (или null)
+//   roomUrl(nick)   — ссылка на комнату
+//   checkStatus(nick) — "online" | "offline" | null (не удалось определить)
+//   caseSensitive   — true, если регистр ника важен (иначе ник приводится к lower-case)
+//   beta            — true, если проверка статуса ещё не проверена на реальном сайте
+// Всё остальное (подписки, список, уведомления) общее.
 // ---------------------------------------------------------------------------
 
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+
+const USERNAME_RE = /^[a-zA-Z0-9_\-.]{2,50}$/;
+
+function httpGet(url, headers = {}) {
+  return fetch(url, {
+    headers: { "User-Agent": BROWSER_UA, Accept: "application/json, text/plain, */*", ...headers },
+    signal: AbortSignal.timeout(10000),
+  });
+}
+
+// Первый сегмент пути как username, кроме служебных разделов сайта
+function firstPathSegment(url, reserved) {
+  const seg = url.pathname.split("/").filter(Boolean)[0];
+  if (!seg) return null;
+  let s;
+  try { s = decodeURIComponent(seg); } catch { return null; }
+  if (reserved.has(s.toLowerCase())) return null;
+  return USERNAME_RE.test(s) ? s : null;
+}
+
+// --- Chaturbate ---------------------------------------------------------------
 
 function cbAjaxRequest(username) {
   return fetch("https://chaturbate.com/get_edge_hls_url_ajax/", {
@@ -135,27 +168,31 @@ function cbAjaxRequest(username) {
 }
 
 function cbPageRequest(username) {
-  return fetch(`https://chaturbate.com/${username}/`, {
-    headers: { "User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9" },
-    signal: AbortSignal.timeout(10000),
-  });
+  return httpGet(`https://chaturbate.com/${username}/`, { "Accept-Language": "en-US,en;q=0.9" });
 }
+
+const CB_RESERVED = new Set([
+  "in", "b", "tag", "tags", "female-cams", "male-cams", "couple-cams", "trans-cams", "followed-cams",
+  "auth", "accounts", "supporter", "tipping", "api", "affiliates", "contest", "security", "terms",
+]);
+
+// --- Провайдеры ---------------------------------------------------------------
 
 const PROVIDERS = {
   chaturbate: {
     name: "Chaturbate",
+    aliases: ["cb", "chaturbate"],
+    hosts: ["chaturbate.com", "chaturbate.global", "chaturbate.eu"],
 
-    parseInput(raw) {
-      const text = String(raw).trim();
-      const m = text.match(/chaturbate\.com\/([a-zA-Z0-9_\-.]+)/i);
-      return (m ? m[1] : text).replace(/^\/+|\/+$/g, "").toLowerCase();
+    parseUrl(url) {
+      // партнёрские ссылки вида /in/?tour=...&room=username
+      const room = url.searchParams.get("room");
+      if (room && USERNAME_RE.test(room)) return room;
+      return firstPathSegment(url, CB_RESERVED);
     },
 
-    roomUrl(username) {
-      return `https://chaturbate.com/${username}/`;
-    },
+    roomUrl: (u) => `https://chaturbate.com/${encodeURIComponent(u)}/`,
 
-    // "online" | "offline" | null (не удалось определить)
     async checkStatus(username) {
       // Метод 1: AJAX-эндпоинт плеера — компактный JSON с room_status
       try {
@@ -185,19 +222,224 @@ const PROVIDERS = {
       }
       return null;
     },
+
+    async debug(user) {
+      const out = {};
+      try {
+        const r = await cbAjaxRequest(user);
+        out.ajax_status = r.status;
+        out.ajax_body = (await r.text()).slice(0, 300);
+      } catch (e) {
+        out.ajax_error = String(e);
+      }
+      try {
+        const r = await cbPageRequest(user);
+        out.html_status = r.status;
+        const t = await r.text();
+        out.html_has_room_status = /"room_status"/.test(t);
+        out.html_snippet = t.slice(0, 200);
+      } catch (e) {
+        out.html_error = String(e);
+      }
+      return out;
+    },
   },
 
-  // stripchat: { name: "Stripchat", parseInput(raw) {...}, roomUrl(c) {...}, async checkStatus(c) {...} },
+  stripchat: {
+    name: "Stripchat",
+    aliases: ["sc", "stripchat", "xhamsterlive"],
+    hosts: ["stripchat.com", "stripchat.global", "stripchat.xxx", "xhamsterlive.com"],
+    caseSensitive: true,
+
+    parseUrl: (url) =>
+      firstPathSegment(
+        url,
+        new Set(["girls", "couples", "men", "trans", "favorites", "login", "signup", "api", "tags", "cams", "girl", "guys", "models", "search", "blog", "en", "ru", "de", "es", "fr", "it"])
+      ),
+
+    roomUrl: (u) => `https://stripchat.com/${encodeURIComponent(u)}`,
+
+    request: (u) => httpGet(`https://stripchat.com/api/front/v2/models/username/${encodeURIComponent(u)}/cam`),
+
+    async checkStatus(u) {
+      try {
+        const res = await this.request(u);
+        if (res.status === 404) return "offline";
+        if (!res.ok) return null;
+        const data = await res.json();
+        const live = data?.user?.isLive ?? data?.user?.user?.isLive ?? data?.cam?.isLive;
+        if (typeof live === "boolean") return live ? "online" : "offline";
+        const st = String(data?.user?.user?.status || "").toLowerCase();
+        if (st) return ["off", "offline", "idle"].includes(st) ? "offline" : "online";
+      } catch {
+        // сеть/JSON — не смогли определить
+      }
+      return null;
+    },
+  },
+
+  cam4: {
+    name: "Cam4",
+    aliases: ["cam4"],
+    hosts: ["cam4.com", "cam4.co.uk", "cam4.de", "cam4.es", "cam4.fr", "cam4.it", "cam4.eu"],
+    beta: true,
+
+    parseUrl: (url) =>
+      firstPathSegment(url, new Set(["female", "male", "couple", "trans", "featured", "login", "signup", "tags", "search", "cams", "rest"])),
+
+    roomUrl: (u) => `https://www.cam4.com/${encodeURIComponent(u)}`,
+
+    request: (u) => httpGet(`https://www.cam4.com/rest/v1.0/profile/${encodeURIComponent(u)}/streamInfo`),
+
+    // Консервативно: online только при явных признаках стрима, offline — при 204/404
+    async checkStatus(u) {
+      try {
+        const res = await this.request(u);
+        if (res.status === 204 || res.status === 404) return "offline";
+        if (!res.ok) return null;
+        const data = await res.json().catch(() => null);
+        if (data && (data.cdnURL || data.edgeURL || data.hlsPreviewUrl || data.canUseCDN)) return "online";
+      } catch {
+        // не смогли определить
+      }
+      return null;
+    },
+  },
+
+  camsoda: {
+    name: "CamSoda",
+    aliases: ["cs", "camsoda"],
+    hosts: ["camsoda.com"],
+    beta: true,
+
+    parseUrl: (url) =>
+      firstPathSegment(url, new Set(["browse", "login", "signup", "tags", "categories", "search", "api", "tips"])),
+
+    roomUrl: (u) => `https://www.camsoda.com/${encodeURIComponent(u)}`,
+
+    request: (u) => httpGet(`https://www.camsoda.com/api/v1/chat/react/${encodeURIComponent(u)}`),
+
+    // Консервативно: online только если в ответе есть данные потока
+    async checkStatus(u) {
+      try {
+        const res = await this.request(u);
+        if (res.status === 404) return "offline";
+        if (!res.ok) return null;
+        const data = await res.json();
+        const s = data?.stream;
+        if (s && (s.token || s.stream_name || (Array.isArray(s.edge_servers) && s.edge_servers.length))) return "online";
+        if (data?.user) return "offline";
+      } catch {
+        // не смогли определить
+      }
+      return null;
+    },
+  },
 };
 
-const DEFAULT_PROVIDER = "chaturbate";
+// Общий debug для провайдеров без своего debug()
+async function debugProvider(key, user) {
+  const p = PROVIDERS[key];
+  const out = { site: key, user };
+  if (p.debug) Object.assign(out, await p.debug(user));
+  else if (p.request) {
+    try {
+      const r = await p.request(user);
+      out.status = r.status;
+      out.body = (await r.text()).slice(0, 400);
+    } catch (e) {
+      out.error = String(e);
+    }
+  }
+  out.resolved = await p.checkStatus(user);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// РАЗБОР ВВОДА: ссылка / "сайт ник" / просто ник
+// ---------------------------------------------------------------------------
+
+const providerKeys = () => Object.keys(PROVIDERS);
+
+function findProviderByAlias(word) {
+  const w = String(word).toLowerCase();
+  return providerKeys().find((k) => k === w || PROVIDERS[k].aliases.includes(w)) || null;
+}
+
+function findProviderByHost(host) {
+  const h = host.toLowerCase().replace(/^www\./, "");
+  return providerKeys().find((k) => PROVIDERS[k].hosts.some((d) => h === d || h.endsWith("." + d))) || null;
+}
+
+function normalizeChannel(key, nick) {
+  return PROVIDERS[key].caseSensitive ? nick : nick.toLowerCase();
+}
+
+function tryParseUrl(token) {
+  const hasScheme = /^https?:\/\//i.test(token);
+  const looksLikeHost = /^([a-z0-9-]+\.)+[a-z]{2,}(\/|\?|#|$)/i.test(token);
+  if (!hasScheme && !looksLikeHost) return null;
+  try {
+    return new URL(hasScheme ? token : "https://" + token);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Результат:
+ *  { type: "ok", provider, channel }   — сайт и ник определены
+ *  { type: "pick", username }          — это просто ник, нужно спросить сайт
+ *  { type: "unsupported", host }       — ссылка на неизвестный сайт
+ *  { type: "invalid" }                 — не похоже ни на что
+ */
+function resolveInput(raw) {
+  const tokens = String(raw).trim().split(/\s+/).filter(Boolean);
+  if (!tokens.length) return { type: "invalid" };
+
+  let forced = null;
+  if (tokens.length === 2) {
+    forced = findProviderByAlias(tokens[0]);
+    if (!forced) return { type: "invalid" };
+    tokens.shift();
+  } else if (tokens.length > 2) {
+    return { type: "invalid" };
+  }
+
+  const token = tokens[0].replace(/^@/, "");
+  const url = tryParseUrl(token);
+
+  if (url) {
+    const key = findProviderByHost(url.hostname);
+    if (key) {
+      if (forced && forced !== key) return { type: "invalid" };
+      const nick = PROVIDERS[key].parseUrl(url);
+      return nick ? { type: "ok", provider: key, channel: normalizeChannel(key, nick) } : { type: "invalid" };
+    }
+    if (/^https?:\/\//i.test(token) || token.includes("/")) {
+      return { type: "unsupported", host: url.hostname.replace(/^www\./, "") };
+    }
+    // иначе это просто ник с точкой (например, john.doe) — идём дальше
+  }
+
+  if (!USERNAME_RE.test(token)) return { type: "invalid" };
+  if (forced) return { type: "ok", provider: forced, channel: normalizeChannel(forced, token) };
+  return { type: "pick", username: token };
+}
+
+const supportedSitesText = () =>
+  providerKeys()
+    .map((k) => `• ${PROVIDERS[k].name}${PROVIDERS[k].beta ? " (β)" : ""}`)
+    .join("\n");
 
 const BOT_COMMANDS = [
   { command: "start", description: "Открыть меню бота" },
   { command: "watch", description: "Следить за каналом: /watch <ссылка>" },
-  { command: "unwatch", description: "Перестать следить: /unwatch <username>" },
+  { command: "unwatch", description: "Перестать следить (без аргумента — выбрать из списка)" },
   { command: "list", description: "Список каналов и их статусы" },
+  { command: "sites", description: "Поддерживаемые сайты" },
 ];
+
 
 // ---------------------------------------------------------------------------
 // TELEGRAM
@@ -227,6 +469,8 @@ async function sendMessage(chatId, text, extra = {}) {
 const answerCallback = (id, text) =>
   tg("answerCallbackQuery", { callback_query_id: id, text, show_alert: false }).catch(() => {});
 
+
+
 function mainMenuKeyboard() {
   return {
     inline_keyboard: [
@@ -242,23 +486,46 @@ function mainMenuKeyboard() {
 
 const statusEmoji = (s) => (s === "online" ? "🟢" : s === "offline" ? "⚪" : "❔");
 
-async function doWatch(chatId, argText) {
-  const provider = DEFAULT_PROVIDER;
-  const p = PROVIDERS[provider];
-  const channel = p.parseInput(argText);
-  if (!channel) return sendMessage(chatId, "Не смог распознать username.");
-
-  await addSubscription(chatId, provider, channel);
-  const status = await p.checkStatus(channel);
-  if (status) await store.set(K.status(provider, channel), status);
+async function doWatch(chatId, providerKey, channel) {
+  const p = PROVIDERS[providerKey];
+  await addSubscription(chatId, providerKey, channel);
+  const status = await p.checkStatus(channel).catch(() => null);
+  if (status) await store.set(K.status(providerKey, channel), status);
 
   const statusText =
     status === "online" ? "🟢 в эфире" : status === "offline" ? "⚪ офлайн" : "не удалось определить (проверю по расписанию)";
   return sendMessage(
     chatId,
-    `Слежу за ${p.name}: ${channel}\nТекущий статус: ${statusText}\nПришлю сообщение, когда начнётся трансляция.`,
+    `Слежу за ${p.name}: ${channel}\nТекущий статус: ${statusText}\nПришлю сообщение, когда начнётся трансляция.` +
+      (p.beta ? `\n\n⚠️ Поддержка ${p.name} экспериментальная — статус может определяться неточно.` : ""),
     { reply_markup: mainMenuKeyboard() }
   );
+}
+
+// Единая точка входа для «пользователь прислал ссылку/ник»
+async function handleWatchInput(chatId, raw) {
+  const r = resolveInput(raw);
+  switch (r.type) {
+    case "ok":
+      await store.del(K.pending(chatId));
+      return doWatch(chatId, r.provider, r.channel);
+    case "pick": {
+      await store.set(K.pending(chatId), r.username, 600);
+      const buttons = providerKeys().map((k) => ({ text: PROVIDERS[k].name, callback_data: `pick:${k}` }));
+      const rows = [];
+      for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
+      return sendMessage(chatId, `На каком сайте «${r.username}»?`, { reply_markup: { inline_keyboard: rows } });
+    }
+    case "unsupported":
+      return sendMessage(chatId, `Сайт ${r.host} пока не поддерживается.\n\nПоддерживаются:\n${supportedSitesText()}`);
+    default:
+      return sendMessage(
+        chatId,
+        "Не смог распознать. Пришли ссылку на канал или username.\n" +
+          "Можно указать сайт явно: /watch stripchat username\n\nПоддерживаются:\n" +
+          supportedSitesText()
+      );
+  }
 }
 
 async function sendList(chatId, { refresh = false } = {}) {
@@ -278,9 +545,8 @@ async function sendList(chatId, { refresh = false } = {}) {
     } else {
       status = await store.get(K.status(s.provider, s.channel));
     }
-    rows.push([
-      { text: `${statusEmoji(status)} [${provider.name}] ${s.channel}`, callback_data: `unwatch:${s.provider}:${s.channel}` },
-    ]);
+    // url-кнопка: по нажатию Telegram сразу открывает комнату
+    rows.push([{ text: `${statusEmoji(status)} [${provider.name}] ${s.channel}`, url: provider.roomUrl(s.channel) }]);
   }
   rows.push([
     { text: "🔄 Обновить статусы", callback_data: "menu:listrefresh" },
@@ -289,16 +555,52 @@ async function sendList(chatId, { refresh = false } = {}) {
 
   return sendMessage(
     chatId,
-    "Твои подписки (🟢 в эфире / ⚪ офлайн / ❔ ещё не проверено). Нажми на канал, чтобы отписаться:",
+    "Твои подписки (🟢 в эфире / ⚪ офлайн / ❔ ещё не проверено). Нажми на канал — откроется комната.\nОтписаться: /unwatch",
     { reply_markup: { inline_keyboard: rows } }
   );
+}
+
+// Клавиатура для отписки: одна кнопка на подписку
+function unwatchKeyboard(subs) {
+  return {
+    inline_keyboard: subs
+      .filter((s) => PROVIDERS[s.provider])
+      .map((s) => [{ text: `❌ [${PROVIDERS[s.provider].name}] ${s.channel}`, callback_data: `unwatch:${s.provider}:${s.channel}` }]),
+  };
+}
+
+async function sendUnwatchMenu(chatId, subs = null) {
+  subs = subs || (await listSubscriptions(chatId));
+  if (subs.length === 0) return sendMessage(chatId, "Ты ни за кем не следишь.");
+  return sendMessage(chatId, "Выбери, от кого отписаться:", { reply_markup: unwatchKeyboard(subs) });
+}
+
+async function doUnwatch(chatId, raw) {
+  const r = resolveInput(raw);
+  if (r.type === "ok") {
+    await removeSubscription(chatId, r.provider, r.channel);
+    return sendMessage(chatId, `Больше не слежу за ${PROVIDERS[r.provider].name}: ${r.channel}.`);
+  }
+  if (r.type === "pick") {
+    // сайт не указан — ищем среди подписок чата
+    const subs = (await listSubscriptions(chatId)).filter((s) => s.channel.toLowerCase() === r.username.toLowerCase());
+    if (subs.length === 0) return sendMessage(chatId, `«${r.username}» нет в твоих подписках. Смотри /list.`);
+    if (subs.length === 1) {
+      await removeSubscription(chatId, subs[0].provider, subs[0].channel);
+      return sendMessage(chatId, `Больше не слежу за ${PROVIDERS[subs[0].provider]?.name || subs[0].provider}: ${subs[0].channel}.`);
+    }
+    return sendUnwatchMenu(chatId, subs); // один ник на нескольких сайтах — пусть выберет
+  }
+  return sendMessage(chatId, "Использование: /unwatch <ссылка или username> (или просто /unwatch — выбрать из списка)");
 }
 
 function sendStartMenu(chatId) {
   return sendMessage(
     chatId,
     "Привет! Я слежу за трансляциями и пришлю уведомление, когда стрим начнётся.\n\n" +
-      `Проверка идёт раз в ${Math.round(CHECK_INTERVAL_SEC / 60 * 10) / 10} мин. Сейчас поддерживается только Chaturbate.`,
+      `Проверка идёт раз в ${Math.round((CHECK_INTERVAL_SEC / 60) * 10) / 10} мин.\n\n` +
+      `Поддерживаемые сайты:\n${supportedSitesText()}\n\n` +
+      "Просто пришли ссылку на канал — сайт определю сам.",
     { reply_markup: mainMenuKeyboard() }
   );
 }
@@ -314,7 +616,11 @@ async function handleCallbackQuery(cq) {
   if (data === "menu:add") {
     await store.set(K.state(chatId), "awaiting_watch", 600);
     await answerCallback(cq.id);
-    return sendMessage(chatId, "Пришли ссылку или username Chaturbate-канала.");
+    return sendMessage(
+      chatId,
+      "Пришли ссылку на канал или username.\nЕсли пришлёшь только username — спрошу, на каком он сайте.\n\n" +
+        `Поддерживаются:\n${supportedSitesText()}`
+    );
   }
   if (data === "menu:list") {
     await answerCallback(cq.id);
@@ -324,11 +630,30 @@ async function handleCallbackQuery(cq) {
     await answerCallback(cq.id, "Проверяю...");
     return sendList(chatId, { refresh: true });
   }
+  if (data.startsWith("pick:")) {
+    const providerKey = data.slice(5);
+    const username = await store.get(K.pending(chatId));
+    if (!PROVIDERS[providerKey]) return answerCallback(cq.id);
+    if (!username) {
+      await answerCallback(cq.id, "Время вышло, пришли ссылку ещё раз");
+      return;
+    }
+    await store.del(K.pending(chatId));
+    await answerCallback(cq.id);
+    return doWatch(chatId, providerKey, normalizeChannel(providerKey, username));
+  }
   if (data.startsWith("unwatch:")) {
     const [, provider, channel] = data.split(":");
     await removeSubscription(chatId, provider, channel);
     await answerCallback(cq.id, `Отписан от ${channel}`);
-    return sendList(chatId);
+    // обновляем то же сообщение: убираем нажатую кнопку
+    const subs = await listSubscriptions(chatId);
+    return tg("editMessageText", {
+      chat_id: chatId,
+      message_id: cq.message.message_id,
+      text: subs.length ? "Выбери, от кого отписаться:" : "Подписок не осталось.",
+      reply_markup: unwatchKeyboard(subs),
+    }).catch(() => {});
   }
   return answerCallback(cq.id);
 }
@@ -340,19 +665,18 @@ async function handleText(chatId, text) {
 
   if (cmd) {
     await store.del(K.state(chatId));
+    await store.del(K.pending(chatId));
     switch (cmd) {
       case "/start":
         return sendStartMenu(chatId);
       case "/watch":
-        return arg ? doWatch(chatId, arg) : sendMessage(chatId, "Использование: /watch <ссылка или username>");
-      case "/unwatch": {
-        if (!arg) return sendMessage(chatId, "Использование: /unwatch <username>");
-        const channel = PROVIDERS[DEFAULT_PROVIDER].parseInput(arg);
-        await removeSubscription(chatId, DEFAULT_PROVIDER, channel);
-        return sendMessage(chatId, `Больше не слежу за ${channel}.`);
-      }
+        return arg ? handleWatchInput(chatId, arg) : sendMessage(chatId, "Использование: /watch <ссылка или username>\nИли: /watch stripchat username");
+      case "/unwatch":
+        return arg ? doUnwatch(chatId, arg) : sendUnwatchMenu(chatId);
       case "/list":
         return sendList(chatId);
+      case "/sites":
+        return sendMessage(chatId, `Поддерживаемые сайты:\n${supportedSitesText()}\n\n(β — экспериментальная поддержка)`);
       default:
         return sendMessage(chatId, "Не знаю такую команду.", { reply_markup: mainMenuKeyboard() });
     }
@@ -360,8 +684,11 @@ async function handleText(chatId, text) {
 
   if ((await store.get(K.state(chatId))) === "awaiting_watch") {
     await store.del(K.state(chatId));
-    return doWatch(chatId, text);
+    return handleWatchInput(chatId, text);
   }
+  // Ссылка на известный сайт без команды — тоже считаем запросом на слежение
+  if (resolveInput(text).type === "ok") return handleWatchInput(chatId, text);
+
   return sendMessage(chatId, "Используй кнопки ниже или команду /start.", { reply_markup: mainMenuKeyboard() });
 }
 
@@ -371,6 +698,7 @@ async function handleUpdate(update) {
   if (!msg || !msg.text) return;
   return handleText(msg.chat.id, msg.text.trim());
 }
+
 
 // ---------------------------------------------------------------------------
 // LONG POLLING
@@ -441,31 +769,11 @@ async function pollAll() {
   }
 }
 
+
+
 // ---------------------------------------------------------------------------
 // HTTP: health-check + диагностика
 // ---------------------------------------------------------------------------
-
-async function debugChaturbate(user) {
-  const out = {};
-  try {
-    const r = await cbAjaxRequest(user);
-    out.ajax_status = r.status;
-    out.ajax_body = (await r.text()).slice(0, 300);
-  } catch (e) {
-    out.ajax_error = String(e);
-  }
-  try {
-    const r = await cbPageRequest(user);
-    out.html_status = r.status;
-    const t = await r.text();
-    out.html_has_room_status = /"room_status"/.test(t);
-    out.html_snippet = t.slice(0, 200);
-  } catch (e) {
-    out.html_error = String(e);
-  }
-  out.resolved = await PROVIDERS.chaturbate.checkStatus(user);
-  return out;
-}
 
 function startHttpServer() {
   http
@@ -473,11 +781,16 @@ function startHttpServer() {
       const url = new URL(req.url, "http://localhost");
       if (url.pathname === "/debug" && DEBUG_KEY && url.searchParams.get("key") === DEBUG_KEY) {
         const user = url.searchParams.get("user");
+        const site = url.searchParams.get("site") || "chaturbate";
         if (!user) {
-          res.writeHead(400).end("need ?user=");
+          res.writeHead(400).end("need ?user= (and optionally &site=" + providerKeys().join("|") + ")");
           return;
         }
-        const result = await debugChaturbate(user);
+        if (!PROVIDERS[site]) {
+          res.writeHead(400).end("unknown site, use one of: " + providerKeys().join(", "));
+          return;
+        }
+        const result = await debugProvider(site, user);
         res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(result, null, 2));
         return;
       }
@@ -485,6 +798,7 @@ function startHttpServer() {
     })
     .listen(PORT, () => console.log(`HTTP на порту ${PORT}`));
 }
+
 
 // ---------------------------------------------------------------------------
 // ЗАПУСК
@@ -523,6 +837,7 @@ if (require.main === module) {
     handleUpdate,
     pollAll,
     PROVIDERS,
+    resolveInput,
     init: async () => {
       store = await createStore();
     },
