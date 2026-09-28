@@ -46,6 +46,7 @@ function memoryStore() {
       if (ttlSec) setTimeout(() => strings.delete(k), ttlSec * 1000).unref();
     },
     async del(k) { strings.delete(k); },
+    async keys() { return [...sets.keys(), ...strings.keys()]; },
   };
 }
 
@@ -58,7 +59,7 @@ async function createStore() {
   const client = createClient({ url: REDIS_URL });
   client.on("error", (e) => console.error("redis error:", e.message));
   await client.connect();
-  console.log("Redis подключён");
+  console.log("Redis подключён:", REDIS_URL.replace(/\/\/[^@]*@/, "//***@"));
   return {
     sadd: (k, v) => client.sAdd(k, v),
     srem: (k, v) => client.sRem(k, v),
@@ -66,6 +67,7 @@ async function createStore() {
     get: (k) => client.get(k),
     set: (k, v, ttlSec) => (ttlSec ? client.set(k, v, { EX: ttlSec }) : client.set(k, v)),
     del: (k) => client.del(k),
+    keys: async () => { const out = []; for await (const k of client.scanIterator({ MATCH: "*", COUNT: 200 })) out.push(k); return out; },
   };
 }
 
@@ -663,7 +665,10 @@ async function handleCallbackQuery(cq) {
   }
   if (data.startsWith("unwatch:")) {
     const [, provider, channel] = data.split(":");
+    const before = (await listSubscriptions(chatId)).some((x) => x.provider === provider && x.channel === channel);
     await removeSubscription(chatId, provider, channel);
+    const after = (await listSubscriptions(chatId)).some((x) => x.provider === provider && x.channel === channel);
+    console.log(`unwatch button chat=${chatId} ${provider}:${channel} была=${before} осталась=${after}`);
     await answerCallback(cq.id, `Отписан от ${channel}`);
     // обновляем то же сообщение: убираем нажатую кнопку
     const subs = await listSubscriptions(chatId);
@@ -694,6 +699,17 @@ async function handleText(chatId, text) {
         return arg ? doUnwatch(chatId, arg) : sendUnwatchMenu(chatId);
       case "/list":
         return sendList(chatId);
+      case "/dump": {
+        if (!DEBUG_KEY || arg !== DEBUG_KEY) return sendMessage(chatId, "Нужно: /dump <DEBUG_KEY>");
+        const keys = (await store.keys()).sort();
+        const mine = await store.smembers(K.subs(chatId));
+        return sendMessage(
+          chatId,
+          `chat id: ${chatId}\nхранилище: ${REDIS_URL ? "Redis" : "ПАМЯТЬ (REDIS_URL не задан!)"}\n\n` +
+            `subs:${chatId}:\n${mine.map((x) => JSON.stringify(x)).join("\n") || "(пусто)"}\n\n` +
+            `Все ключи (${keys.length}):\n${keys.slice(0, 60).join("\n")}`.slice(0, 3500)
+        );
+      }
       case "/sites":
         return sendMessage(chatId, `Поддерживаемые сайты:\n${supportedSitesText()}\n\n(β — экспериментальная поддержка)`);
       default:
