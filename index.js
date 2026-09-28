@@ -201,6 +201,8 @@ const CB_RESERVED = new Set([
   "auth", "accounts", "supporter", "tipping", "api", "affiliates", "contest", "security", "terms",
 ]);
 
+const BC_LIVE_SHOWS = new Set(["public", "private", "group", "ticket", "vip", "true_private", "exclusive", "party"]);
+
 const BC_RESERVED = new Set([
   "girls", "couples", "male", "trans", "tags", "tag", "login", "signup", "register", "search", "tools",
   "api", "contest", "models", "chat", "favorites", "blog", "help", "support", "terms", "privacy", "cams",
@@ -482,7 +484,7 @@ const PROVIDERS = {
         signal: AbortSignal.timeout(10000),
       }),
 
-    // Консервативно: online — есть videoServerUrl или showType != offline; offline — только по явным признакам
+    // videoServerUrl НЕ признак эфира (у оффлайн-моделей он тоже бывает) — смотрим только явные флаги
     async checkStatus(u) {
       try {
         const res = await this.request(u);
@@ -494,14 +496,34 @@ const PROVIDERS = {
         const perf = data.performerData || {};
         if (perf.username && String(perf.username).toLowerCase() !== u.toLowerCase()) return null;
 
-        if (data.localData && data.localData.videoServerUrl) return "online";
-        if (typeof perf.isOnline === "boolean") return perf.isOnline ? "online" : "offline";
-        const show = String(perf.showType || "").toLowerCase();
-        if (show) return show === "offline" ? "offline" : "online";
+        const show = String(perf.showType ?? perf.show_type ?? "").toLowerCase();
+        if (perf.isOnline === false || perf.isOffline === true || show === "offline" || show === "off") return "offline";
+        if (perf.isOnline === true && (!show || BC_LIVE_SHOWS.has(show))) return "online";
+        if (BC_LIVE_SHOWS.has(show) && perf.isOnline === undefined && perf.isOffline === undefined) return "online";
       } catch {
         // не смогли определить
       }
       return null;
+    },
+
+    // /debug?key=...&site=bongacams&user=НИК — сводка по полям ответа
+    async debug(u) {
+      const out = {};
+      try {
+        const res = await this.request(u);
+        out.http = res.status;
+        const text = await res.text();
+        out.body_start = text.slice(0, 300);
+        const data = JSON.parse(text);
+        const scalars = (o) => Object.fromEntries(Object.entries(o || {}).filter(([, v]) => v === null || ["string", "number", "boolean"].includes(typeof v)).map(([k, v]) => [k, typeof v === "string" ? v.slice(0, 80) : v]));
+        out.top_keys = Object.keys(data);
+        out.status_field = data.status;
+        out.performerData = scalars(data.performerData);
+        out.localData = scalars(data.localData);
+      } catch (e) {
+        out.error = String(e);
+      }
+      return out;
     },
   },
 };
