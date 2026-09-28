@@ -1,0 +1,16 @@
+{
+  "name": "streampingbot",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Telegram-бот: уведомляет, когда отслеживаемый стример вышел в эфир (Node + Redis, long polling)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "redis": "^4.7.0"
+  }
+}

@@ -1,0 +1,29 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  bot:
+    build: .
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Порт нужен только для /debug и health-check. Раскомментируй, если хочешь открыть /debug снаружи:
+    # ports:
+    #   - "3000:3000"
+
+volumes:
+  redis-data:
