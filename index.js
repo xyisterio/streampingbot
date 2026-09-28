@@ -18,6 +18,7 @@
  */
 
 const http = require("http");
+const crypto = require("crypto");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const REDIS_URL = process.env.REDIS_URL || "";
@@ -113,6 +114,28 @@ async function dropChat(chatId) {
   }
 }
 
+
+// Чистка «кривых» записей: канал сохранён как ссылка (https://site/user) или с лишними символами.
+// Приводим к нормальному нику; если не распознали — удаляем запись.
+async function migrateBadChannels() {
+  let fixed = 0;
+  for (const key of await store.keys()) {
+    if (!key.startsWith("subs:")) continue;
+    const chatId = key.slice(5);
+    for (const item of await store.smembers(key)) {
+      const i = item.indexOf(":");
+      const provider = item.slice(0, i);
+      const channel = item.slice(i + 1);
+      if (PROVIDERS[provider] && !/[:\/]/.test(channel)) continue;
+      const r = PROVIDERS[provider] ? resolveInput(channel) : { type: "invalid" };
+      await removeSubscription(chatId, provider, channel);
+      if (r.type === "ok") await addSubscription(chatId, r.provider, r.channel);
+      fixed++;
+      console.log(`migrate: ${chatId} ${item} -> ${r.type === "ok" ? r.provider + ":" + r.channel : "удалено"}`);
+    }
+  }
+  if (fixed) console.log(`migrate: исправлено записей: ${fixed}`);
+}
 
 // ---------------------------------------------------------------------------
 // PROVIDERS — логика конкретных сайтов.
@@ -481,6 +504,7 @@ async function sendMessage(chatId, text, extra = {}) {
     console.error("sendMessage failed:", e.message);
     return { ok: false };
   }
+  if (!r.ok) console.error("sendMessage error:", r.error_code, r.description);
   if (!r.ok && r.error_code === 403) await dropChat(chatId).catch(() => {});
   return r;
 }
@@ -579,12 +603,17 @@ async function sendList(chatId, { refresh = false } = {}) {
   );
 }
 
+// callback_data в Telegram — максимум 64 байта. "unwatch:provider:channel" с длинным ником не влезает,
+// и Telegram отвергает ВСЮ клавиатуру (меню просто не появляется). Поэтому шлём короткий хэш.
+const subId = (provider, channel) =>
+  crypto.createHash("sha1").update(`${provider}:${channel}`).digest("hex").slice(0, 16);
+
 // Клавиатура для отписки: одна кнопка на подписку
 function unwatchKeyboard(subs) {
   return {
     inline_keyboard: subs
       .filter((s) => PROVIDERS[s.provider])
-      .map((s) => [{ text: `❌ [${PROVIDERS[s.provider].name}] ${s.channel}`, callback_data: `unwatch:${s.provider}:${s.channel}` }]),
+      .map((s) => [{ text: `❌ [${PROVIDERS[s.provider].name}] ${s.channel}`, callback_data: `uw:${subId(s.provider, s.channel)}` }]),
   };
 }
 
@@ -663,21 +692,33 @@ async function handleCallbackQuery(cq) {
     await answerCallback(cq.id);
     return doWatch(chatId, providerKey, normalizeChannel(providerKey, username));
   }
-  if (data.startsWith("unwatch:")) {
-    const [, provider, channel] = data.split(":");
-    const before = (await listSubscriptions(chatId)).some((x) => x.provider === provider && x.channel === channel);
-    await removeSubscription(chatId, provider, channel);
-    const after = (await listSubscriptions(chatId)).some((x) => x.provider === provider && x.channel === channel);
-    console.log(`unwatch button chat=${chatId} ${provider}:${channel} была=${before} осталась=${after}`);
-    await answerCallback(cq.id, `Отписан от ${channel}`);
-    // обновляем то же сообщение: убираем нажатую кнопку
+  if (data.startsWith("uw:") || data.startsWith("unwatch:")) {
+    const current = await listSubscriptions(chatId);
+    let target;
+    if (data.startsWith("uw:")) {
+      const id = data.slice(3);
+      target = current.find((x) => subId(x.provider, x.channel) === id);
+    } else {
+      // старый формат кнопок (уже отправленные сообщения)
+      const [, provider, ...rest] = data.split(":");
+      const channel = rest.join(":");
+      target = current.find((x) => x.provider === provider && x.channel === channel);
+    }
+    if (target) await removeSubscription(chatId, target.provider, target.channel);
     const subs = await listSubscriptions(chatId);
-    return tg("editMessageText", {
+    console.log(
+      `unwatch button chat=${chatId} target=${target ? target.provider + ":" + target.channel : "не найдена"} осталось=${subs.length}`
+    );
+    await answerCallback(cq.id, target ? `Отписан от ${target.channel}` : "Уже удалено");
+    // обновляем то же сообщение: убираем нажатую кнопку
+    const r = await tg("editMessageText", {
       chat_id: chatId,
       message_id: cq.message.message_id,
       text: subs.length ? "Выбери, от кого отписаться:" : "Подписок не осталось.",
       reply_markup: unwatchKeyboard(subs),
-    }).catch(() => {});
+    }).catch((e) => ({ ok: false, description: e.message }));
+    if (!r.ok && !/not modified/i.test(r.description || "")) console.error("editMessageText error:", r.error_code, r.description);
+    return;
   }
   return answerCallback(cq.id);
 }
@@ -845,6 +886,7 @@ async function main() {
     process.exit(1);
   }
   store = await createStore();
+  await migrateBadChannels().catch((e) => console.error("migrate error:", e));
   startHttpServer();
 
   // Старый вебхук (от воркера) мешает getUpdates — снимаем
