@@ -284,11 +284,77 @@ const PROVIDERS = {
 
     roomUrl: (u) => `https://stripchat.com/${encodeURIComponent(u)}`,
 
-    request: (u) =>
-      httpGet(`https://stripchat.com/api/front/v2/models/username/${encodeURIComponent(u)}/cam`, {
-        Referer: `https://stripchat.com/${encodeURIComponent(u)}`,
-        "Accept-Language": "en-US,en;q=0.9",
-      }),
+    // Перебираем зеркала: у разных доменов разные правила антибота. Если задан SC_RELAY —
+    // запрос идёт через твой Cloudflare Worker (см. cf-relay-worker.js), у него другие IP.
+    async request(u) {
+      const path = `/api/front/v2/models/username/${encodeURIComponent(u)}/cam`;
+      const relay = process.env.SC_RELAY || "";
+      const bases = ["https://stripchat.com", "https://xhamsterlive.com", "https://stripchat.global"];
+      let last, lastErr;
+      for (const base of relay ? bases.slice(0, 1) : bases) {
+        const target = base + path;
+        const headers = { Referer: `${base}/${encodeURIComponent(u)}`, "Accept-Language": "en-US,en;q=0.9" };
+        try {
+          const res = relay
+            ? await httpGet(`${relay}${relay.includes("?") ? "&" : "?"}url=${encodeURIComponent(target)}`, {
+                ...headers,
+                "X-Relay-Key": process.env.SC_RELAY_KEY || "",
+              })
+            : await httpGet(target, headers);
+          if (res.ok || res.status === 404) return res;
+          last = res;
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      if (last) return last;
+      throw lastErr;
+    },
+
+    // Диагностика: /debug?key=...&site=stripchat&user=НИК — что именно отвечает Stripchat с ЭТОГО сервера
+    async debug(u) {
+      const probe = async (label, url, headers = {}) => {
+        const r = { label, url };
+        try {
+          const res = await httpGet(url, headers);
+          const body = await res.text();
+          r.status = res.status;
+          r.server = res.headers.get("server");
+          r.cf_ray = res.headers.get("cf-ray");
+          r.cf_mitigated = res.headers.get("cf-mitigated");
+          r.content_type = res.headers.get("content-type");
+          r.is_json = /json/i.test(r.content_type || "");
+          const text = body.replace(/<(script|style)[\s\S]*?<\/\1>/gi, " ").replace(/<[^>]+>/g, " ");
+          r.offline_marker_in_text = /оффлайн|офлайн|offline/i.test(text);
+          r.snippet = body.slice(0, 200).replace(/\s+/g, " ");
+        } catch (e) {
+          r.error = String(e);
+        }
+        return r;
+      };
+      const enc = encodeURIComponent(u);
+      const probes = [];
+      for (const base of ["https://stripchat.com", "https://xhamsterlive.com", "https://stripchat.global"]) {
+        probes.push(await probe(`api ${base}`, `${base}/api/front/v2/models/username/${enc}/cam`, { Referer: `${base}/${enc}` }));
+      }
+      probes.push(await probe("html stripchat.com", `https://stripchat.com/${enc}`, { Accept: "text/html", "Accept-Language": "ru-RU,ru;q=0.9" }));
+      const relay = process.env.SC_RELAY || "";
+      if (relay) {
+        const target = `https://stripchat.com/api/front/v2/models/username/${enc}/cam`;
+        probes.push(await probe("api через SC_RELAY", `${relay}${relay.includes("?") ? "&" : "?"}url=${encodeURIComponent(target)}`, { "X-Relay-Key": process.env.SC_RELAY_KEY || "" }));
+      }
+      const okApi = probes.some((x) => x.label.startsWith("api") && x.status === 200 && x.is_json);
+      const all403 = probes.filter((x) => x.status).every((x) => x.status === 403 || x.status === 429);
+      const cf = probes.some((x) => /cloudflare/i.test(x.server || "") || x.cf_mitigated);
+      const verdict = okApi
+        ? "НЕ блок: API отвечает JSON (проблема в разборе ответа)"
+        : all403 && cf
+          ? "БЛОК: 403/429 от Cloudflare — IP хостинга режется. Нужен SC_RELAY (cf-relay-worker.js) или другой хост"
+          : all403
+            ? "403/429 без следов Cloudflare — блок на стороне сайта/хостинга"
+            : "смешанный результат — смотри probes";
+      return { verdict, probes };
+    },
 
     async checkStatus(u) {
       let res;
