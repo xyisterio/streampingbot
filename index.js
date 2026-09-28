@@ -259,21 +259,38 @@ const PROVIDERS = {
 
     roomUrl: (u) => `https://stripchat.com/${encodeURIComponent(u)}`,
 
-    request: (u) => httpGet(`https://stripchat.com/api/front/v2/models/username/${encodeURIComponent(u)}/cam`),
+    request: (u) =>
+      httpGet(`https://stripchat.com/api/front/v2/models/username/${encodeURIComponent(u)}/cam`, {
+        Referer: `https://stripchat.com/${encodeURIComponent(u)}`,
+        "Accept-Language": "en-US,en;q=0.9",
+      }),
 
     async checkStatus(u) {
+      let res;
       try {
-        const res = await this.request(u);
-        if (res.status === 404) return "offline";
-        if (!res.ok) return null;
-        const data = await res.json();
-        const live = data?.user?.isLive ?? data?.user?.user?.isLive ?? data?.cam?.isLive;
-        if (typeof live === "boolean") return live ? "online" : "offline";
-        const st = String(data?.user?.user?.status || "").toLowerCase();
-        if (st) return ["off", "offline", "idle"].includes(st) ? "offline" : "online";
-      } catch {
-        // сеть/JSON — не смогли определить
+        res = await this.request(u);
+      } catch (e) {
+        console.warn(`[stripchat] ${u}: запрос не удался: ${e.message}`);
+        return null;
       }
+      if (res.status === 404) return "offline";
+      if (!res.ok) {
+        console.warn(`[stripchat] ${u}: HTTP ${res.status} (403/429 или HTML — вероятно, блок по IP)`);
+        return null;
+      }
+      let data;
+      try {
+        data = await res.json();
+      } catch {
+        console.warn(`[stripchat] ${u}: ответ не JSON (скорее всего страница-заглушка антибота)`);
+        return null;
+      }
+      const user = data?.user?.user ?? data?.user ?? {};
+      const live = user.isLive ?? data?.user?.isLive ?? data?.cam?.isLive;
+      if (typeof live === "boolean") return live ? "online" : "offline";
+      const st = String(user.status || "").toLowerCase();
+      if (st) return ["off", "offline", "idle"].includes(st) ? "offline" : "online";
+      console.warn(`[stripchat] ${u}: неизвестная структура ответа, ключи: ${Object.keys(data || {}).join(",")}`);
       return null;
     },
   },
@@ -577,21 +594,23 @@ async function sendUnwatchMenu(chatId, subs = null) {
 
 async function doUnwatch(chatId, raw) {
   const r = resolveInput(raw);
-  if (r.type === "ok") {
-    await removeSubscription(chatId, r.provider, r.channel);
-    return sendMessage(chatId, `Больше не слежу за ${PROVIDERS[r.provider].name}: ${r.channel}.`);
+  if (r.type !== "ok" && r.type !== "pick") {
+    return sendMessage(chatId, "Использование: /unwatch <ссылка или username> (или просто /unwatch — выбрать из списка)");
   }
-  if (r.type === "pick") {
-    // сайт не указан — ищем среди подписок чата
-    const subs = (await listSubscriptions(chatId)).filter((s) => s.channel.toLowerCase() === r.username.toLowerCase());
-    if (subs.length === 0) return sendMessage(chatId, `«${r.username}» нет в твоих подписках. Смотри /list.`);
-    if (subs.length === 1) {
-      await removeSubscription(chatId, subs[0].provider, subs[0].channel);
-      return sendMessage(chatId, `Больше не слежу за ${PROVIDERS[subs[0].provider]?.name || subs[0].provider}: ${subs[0].channel}.`);
-    }
-    return sendUnwatchMenu(chatId, subs); // один ник на нескольких сайтах — пусть выберет
-  }
-  return sendMessage(chatId, "Использование: /unwatch <ссылка или username> (или просто /unwatch — выбрать из списка)");
+  const username = r.type === "ok" ? r.channel : r.username;
+  const forced = r.type === "ok" ? r.provider : null;
+
+  // Ищем среди РЕАЛЬНЫХ подписок чата без учёта регистра: у Stripchat ник регистрозависимый,
+  // и удалять нужно ровно ту строку, что лежит в Redis.
+  const subs = (await listSubscriptions(chatId)).filter(
+    (s) => (!forced || s.provider === forced) && s.channel.toLowerCase() === username.toLowerCase()
+  );
+  if (subs.length === 0) return sendMessage(chatId, `«${username}» нет в твоих подписках. Смотри /list.`);
+  if (subs.length > 1) return sendUnwatchMenu(chatId, subs); // один ник на нескольких сайтах — пусть выберет
+
+  const { provider, channel } = subs[0];
+  await removeSubscription(chatId, provider, channel);
+  return sendMessage(chatId, `Больше не слежу за ${PROVIDERS[provider]?.name || provider}: ${channel}.`);
 }
 
 function sendStartMenu(chatId) {
