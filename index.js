@@ -720,36 +720,49 @@ async function handleWatchInput(chatId, raw) {
   }
 }
 
-async function sendList(chatId, { refresh = false } = {}) {
+async function sendList(chatId, { refresh = false, messageId = null } = {}) {
   const subs = await listSubscriptions(chatId);
   if (subs.length === 0) {
-    return sendMessage(chatId, "Пока нет отслеживаемых каналов.", { reply_markup: mainMenuKeyboard() });
+    const text = "Пока нет отслеживаемых каналов.";
+    if (messageId) {
+      const r = await tg("editMessageText", { chat_id: chatId, message_id: messageId, text, reply_markup: mainMenuKeyboard() }).catch(() => null);
+      if (r?.ok || /not modified/i.test(r?.description || "")) return r;
+    }
+    return sendMessage(chatId, text, { reply_markup: mainMenuKeyboard() });
   }
 
-  const rows = [];
-  for (const s of subs) {
-    const provider = PROVIDERS[s.provider];
-    if (!provider) continue;
-    let status;
-    if (refresh) {
-      status = await provider.checkStatus(s.channel).catch(() => null);
-      if (status) await store.set(K.status(s.provider, s.channel), status);
-    } else {
-      status = await store.get(K.status(s.provider, s.channel));
-    }
-    // url-кнопка: по нажатию Telegram сразу открывает комнату
-    rows.push([{ text: `${statusEmoji(status)} [${provider.name}] ${s.channel}`, url: provider.roomUrl(s.channel) }]);
-  }
+  const items = subs.filter((s) => PROVIDERS[s.provider]);
+  const statuses = await Promise.all(
+    items.map(async (s) => {
+      const provider = PROVIDERS[s.provider];
+      if (refresh) {
+        const st = await provider.checkStatus(s.channel).catch(() => null);
+        if (st) await store.set(K.status(s.provider, s.channel), st);
+        return st || (await store.get(K.status(s.provider, s.channel)));
+      }
+      return store.get(K.status(s.provider, s.channel));
+    })
+  );
+
+  // url-кнопка: по нажатию Telegram сразу открывает комнату
+  const rows = items.map((s, i) => [
+    { text: `${statusEmoji(statuses[i])} [${PROVIDERS[s.provider].name}] ${s.channel}`, url: PROVIDERS[s.provider].roomUrl(s.channel) },
+  ]);
   rows.push([
     { text: "🔄 Обновить статусы", callback_data: "menu:listrefresh" },
     { text: "➕ Добавить", callback_data: "menu:add" },
   ]);
 
-  return sendMessage(
-    chatId,
-    "Твои подписки (🟢 в эфире / ⚪ офлайн / ❔ ещё не проверено). Нажми на канал — откроется комната.\nОтписаться: /unwatch",
-    { reply_markup: { inline_keyboard: rows } }
-  );
+  const text = "Твои подписки (🟢 в эфире / ⚪ офлайн / ❔ ещё не проверено). Нажми на канал — откроется комната.\nОтписаться: /unwatch";
+  const reply_markup = { inline_keyboard: rows };
+
+  // Обновление — правим существующее сообщение, а не шлём новое
+  if (messageId) {
+    const r = await tg("editMessageText", { chat_id: chatId, message_id: messageId, text, reply_markup }).catch(() => null);
+    if (r?.ok || /not modified/i.test(r?.description || "")) return r;
+    console.error("editMessageText (list) error:", r?.error_code, r?.description);
+  }
+  return sendMessage(chatId, text, { reply_markup });
 }
 
 // callback_data в Telegram — максимум 64 байта. "unwatch:provider:channel" с длинным ником не влезает,
@@ -827,7 +840,7 @@ async function handleCallbackQuery(cq) {
   }
   if (data === "menu:listrefresh") {
     await answerCallback(cq.id, "Проверяю...");
-    return sendList(chatId, { refresh: true });
+    return sendList(chatId, { refresh: true, messageId: cq.message.message_id });
   }
   if (data.startsWith("pick:")) {
     const providerKey = data.slice(5);
@@ -974,7 +987,7 @@ async function checkOneChannel(providerKey, channel) {
   if (newStatus === "online" && oldStatus === "offline") {
     const watchers = await store.smembers(K.watchers(providerKey, channel));
     const url = provider.roomUrl(channel);
-    await Promise.all(watchers.map((id) => sendMessage(id, `🔴 ${channel} в эфире!\n${url}`)));
+    await Promise.all(watchers.map((id) => sendMessage(id, `🟢 ${channel} в эфире!\n${url}`)));
   }
 }
 
